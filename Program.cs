@@ -196,6 +196,8 @@ builder.Services.AddScoped<MailArchiver.Utilities.DateTimeHelper>();
 // Add HTTP Client factory (used by VersionUpdateService for GitHub API calls)
 builder.Services.AddHttpClient("GitHubReleases");
 builder.Services.AddHttpClient("MsaOAuth");
+builder.Services.AddHttpClient(MailArchiver.Services.MailSyncBackgroundService.BackoffPushHttpClientName,
+    client => client.Timeout = TimeSpan.FromSeconds(10));
 
 // Register CSV import options for bulk IMAP account import
 builder.Services.Configure<CsvImportOptions>(builder.Configuration.GetSection(CsvImportOptions.CsvImport));
@@ -431,6 +433,7 @@ builder.Services.AddScoped<IUserService, UserService>();
 // REST API (ApiControllerBase) and the MCP server (McpToolBase).
 builder.Services.AddScoped<IAccountAccessResolver, AccountAccessResolver>();
 builder.Services.AddSingleton<ISyncJobService, SyncJobService>(); // NEUE SERVICE
+builder.Services.AddSingleton<ISyncBackoffTracker, SyncBackoffTracker>();
 
 // Register BatchRestoreService as singleton and hosted service - MUST be the same instance
 builder.Services.AddSingleton<BatchRestoreService>();

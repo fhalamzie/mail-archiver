@@ -23,6 +23,8 @@ namespace MailArchiver.Services
         private const int ShutdownGraceSeconds = 30;
         // Sentinel watermark meaning "no sync yet, force a full sync".
         private static readonly DateTime EpochUtc = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+        // Named HttpClient for MailSync:BackoffPushUrl, registered in Program.cs.
+        public const string BackoffPushHttpClientName = "SyncBackoffPush";
 
         public MailSyncBackgroundService(
             IServiceProvider serviceProvider,
@@ -58,6 +60,11 @@ namespace MailArchiver.Services
             // the initial burst of the first N tasks starting together).
             var interAccountDelaySeconds = _configuration.GetValue<int>("MailSync:InterAccountDelaySeconds", 0);
             if (interAccountDelaySeconds < 0) interAccountDelaySeconds = 0;
+            // Optional Uptime-Kuma-style push URL reporting whether any account is stuck in a failure
+            // run. Empty = no push.
+            var backoffPushUrl = _configuration.GetValue<string>("MailSync:BackoffPushUrl");
+            var lastBackoffPushUtc = DateTime.MinValue;
+            var lastBackoffPushFailed = false;
 
             // Per-account next-run scheduling state, keyed by account Id. Persists across
             // poll cycles so that intervals survive the short 60s polling cadence. Uses
@@ -88,6 +95,8 @@ namespace MailArchiver.Services
             // ISyncJobService is a singleton, so it can be resolved once here. It knows about syncs
             // this loop did not start - a manual sync from the account page - which inFlight cannot.
             var syncJobs = _serviceProvider.GetRequiredService<ISyncJobService>();
+            // Singleton as well; the account edit page resets it when credentials change.
+            var backoff = _serviceProvider.GetRequiredService<ISyncBackoffTracker>();
 
             // With a single slot the syncs are sequential, so the blocking compaction can run after
             // each account exactly as before. With more, it waits for the last one to finish.
@@ -139,6 +148,7 @@ namespace MailArchiver.Services
                         nextRunUtc.TryRemove(id, out _);
                     foreach (var id in lastFullSyncUtc.Keys.Where(k => !activeIds.Contains(k)).ToList())
                         lastFullSyncUtc.TryRemove(id, out _);
+                    backoff.Prune(activeIds);
 
                     var nowUtc = DateTime.UtcNow;
 
@@ -166,8 +176,13 @@ namespace MailArchiver.Services
                             running.Add(account.Id);
                     }
 
+                    // Accounts in a failure run are held back here, not by moving their due time:
+                    // the due time stays whatever the interval says, so an account whose run is
+                    // reset (credentials edited) is picked up on the very next tick.
                     var dispatchOrder = SyncDispatchPlanner.SelectDueAccounts(
-                        accounts.Select(a => (a.Id, nextRunUtc[a.Id])),
+                        accounts
+                            .Where(a => !backoff.IsBlocked(a.Id, nowUtc))
+                            .Select(a => (a.Id, nextRunUtc[a.Id])),
                         nowUtc,
                         running);
 
@@ -240,9 +255,10 @@ namespace MailArchiver.Services
 
                         _ = Task.Run(async () =>
                         {
+                            var outcome = SyncOutcome.Skipped;
                             try
                             {
-                                await SyncOneAccountAsync(
+                                outcome = await SyncOneAccountAsync(
                                     account, performFullSync, lastFullSyncUtc, syncTimeoutMinutes,
                                     compactAfterEachAccount, interAccountDelaySeconds, stoppingToken);
                             }
@@ -250,9 +266,12 @@ namespace MailArchiver.Services
                             {
                                 _logger.LogError(ex, "Unhandled error in the sync task for account {AccountName}: {Message}",
                                     account.Name, ex.Message);
+                                outcome = SyncOutcome.Failed(ex);
                             }
                             finally
                             {
+                                RecordBackoff(backoff, account, outcome);
+
                                 // Whatever happened: schedule the next run from the end of this one.
                                 // The batch loop scheduled it at dispatch time, which for any account
                                 // whose sync outlasts its own interval means it is due again the moment
@@ -283,6 +302,15 @@ namespace MailArchiver.Services
                                 }
                             }
                         }, CancellationToken.None);
+                    }
+
+                    // At most once a minute: the tick wakes early whenever a slot frees up.
+                    if (!string.IsNullOrWhiteSpace(backoffPushUrl)
+                        && DateTime.UtcNow - lastBackoffPushUtc >= TimeSpan.FromSeconds(PollIntervalSeconds))
+                    {
+                        lastBackoffPushUtc = DateTime.UtcNow;
+                        lastBackoffPushFailed = await PushBackoffStatusAsync(
+                            backoffPushUrl, backoff, accountsById, lastBackoffPushFailed, stoppingToken);
                     }
 
                 }
@@ -363,7 +391,7 @@ namespace MailArchiver.Services
         /// around it can be read on its own. The body is unchanged apart from one thing: LastFullSync
         /// is stamped with the moment the sync finished rather than the moment its cycle began.
         /// </summary>
-        private async Task SyncOneAccountAsync(
+        private async Task<SyncOutcome> SyncOneAccountAsync(
             MailAccount account,
             bool performFullSync,
             ConcurrentDictionary<int, DateTime> lastFullSyncUtc,
@@ -379,6 +407,9 @@ namespace MailArchiver.Services
             // - which the account list and the dashboard render as "sync in progress" - and the
             // scheduler's own running check would have locked the account out of every future tick.
             string? jobId = null;
+            // Completed unless a catch below says otherwise. A sync that ended itself as TimedOut
+            // still counts: it logged in, which is all the backoff cares about.
+            var outcome = SyncOutcome.Completed;
 
             try
             {
@@ -404,7 +435,7 @@ namespace MailArchiver.Services
                             status.BytesDownloaded / (1024.0 * 1024.0),
                             status.DailyLimitBytes / (1024.0 * 1024.0),
                             status.ResetTime);
-                        return;
+                        return SyncOutcome.Skipped;
                     }
                 }
 
@@ -440,7 +471,7 @@ namespace MailArchiver.Services
                 {
                     _logger.LogWarning("Skipping sync for account {AccountId} ({AccountName}) - account no longer exists or is disabled",
                         account.Id, account.Name);
-                    return;
+                    return SyncOutcome.Skipped;
                 }
 
                 syncJobService.UpdateJobProgress(jobId, job =>
@@ -505,7 +536,7 @@ namespace MailArchiver.Services
                     _logger.LogDebug(storageEx, "Storage cache refresh after sync failed (non-fatal) for account {AccountId}", account.Id);
                 }
             }
-            catch (OperationCanceledException)
+            catch (OperationCanceledException oce)
             {
                 // The sync timeout and a UI cancel are no longer delivered as
                 // OperationCanceledException — the sync loops poll both signals
@@ -515,12 +546,16 @@ namespace MailArchiver.Services
                 _logger.LogWarning("Sync for account {AccountName} was cancelled unexpectedly",
                     account.Name);
                 FailUnfinishedJob(jobId, "Sync was cancelled unexpectedly");
+                // Host shutdown is not the account's fault; anything else is treated like any other
+                // unexplained abort (soft).
+                outcome = ct.IsCancellationRequested ? SyncOutcome.Skipped : SyncOutcome.Failed(oce);
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Error syncing mail account {AccountName}: {Message}",
                     account.Name, ex.Message);
                 FailUnfinishedJob(jobId, ex.Message);
+                outcome = SyncOutcome.Failed(ex);
             }
             // accountScope disposed here - DbContext + any leftover tracked entities gone
 
@@ -543,6 +578,107 @@ namespace MailArchiver.Services
                 {
                     // Shutdown during the inter-account delay — exit gracefully.
                 }
+            }
+
+            return outcome;
+        }
+
+        /// <summary>How one dispatched sync ended, as far as the backoff is concerned.</summary>
+        private sealed record SyncOutcome(bool Ran, Exception? Error)
+        {
+            /// <summary>Nothing was attempted (bandwidth limit, account gone, host shutdown).</summary>
+            public static readonly SyncOutcome Skipped = new(false, null);
+
+            /// <summary>The sync returned without throwing - it logged in.</summary>
+            public static readonly SyncOutcome Completed = new(true, null);
+
+            public static SyncOutcome Failed(Exception error) => new(true, error);
+        }
+
+        /// <summary>
+        /// Feeds one sync's outcome into the backoff tracker and logs every change of an account's
+        /// failure run. Never throws: it runs in the dispatch task's finally, ahead of releasing the slot.
+        /// </summary>
+        private void RecordBackoff(ISyncBackoffTracker backoff, MailAccount account, SyncOutcome outcome)
+        {
+            try
+            {
+                if (!outcome.Ran)
+                    return;
+
+                if (outcome.Error == null)
+                {
+                    var ended = backoff.RecordSuccess(account.Id);
+                    if (ended != null)
+                    {
+                        _logger.LogInformation(
+                            "Sync backoff cleared for account {AccountName}: sync succeeded after {Count} consecutive {Kind} failure(s)",
+                            account.Name, ended.ConsecutiveFailures, ended.Kind);
+                    }
+                    return;
+                }
+
+                var kind = SyncFailureClassifier.Classify(outcome.Error);
+                var state = backoff.RecordFailure(account.Id, kind, DateTime.UtcNow);
+                var alarming = backoff.AlarmingAccounts().Contains(account.Id);
+                _logger.Log(
+                    alarming ? LogLevel.Warning : LogLevel.Information,
+                    "Sync backoff for account {AccountName}: {Kind} failure #{Count}, next attempt not before {NotBeforeUtc:u}{Alarm}. Cause: {Message}",
+                    account.Name, state.Kind, state.ConsecutiveFailures, state.NotBeforeUtc,
+                    alarming ? " (alarming)" : string.Empty, outcome.Error.Message);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Could not record sync backoff for account {AccountId}", account.Id);
+            }
+        }
+
+        /// <summary>
+        /// Reports to an Uptime-Kuma-style push URL whether any account is stuck in an alarming
+        /// failure run. Any query string on the configured URL is replaced. Returns whether the push
+        /// failed, so a monitor that stays unreachable is logged once instead of every minute.
+        /// </summary>
+        private async Task<bool> PushBackoffStatusAsync(
+            string pushUrl,
+            ISyncBackoffTracker backoff,
+            IReadOnlyDictionary<int, MailAccount> accountsById,
+            bool previousPushFailed,
+            CancellationToken ct)
+        {
+            try
+            {
+                var alarming = backoff.AlarmingAccounts()
+                    .Select(id => accountsById.TryGetValue(id, out var a) ? a.Name : $"#{id}")
+                    .ToList();
+
+                var message = alarming.Count == 0
+                    ? "OK"
+                    : $"Sync failing: {string.Join(", ", alarming)}";
+                if (message.Length > 200)
+                    message = message[..197] + "...";
+
+                var builder = new UriBuilder(pushUrl)
+                {
+                    Query = $"status={(alarming.Count == 0 ? "up" : "down")}&msg={Uri.EscapeDataString(message)}&ping="
+                };
+
+                var client = _serviceProvider.GetRequiredService<IHttpClientFactory>().CreateClient(BackoffPushHttpClientName);
+                using var response = await client.GetAsync(builder.Uri, ct);
+                response.EnsureSuccessStatusCode();
+
+                if (previousPushFailed)
+                    _logger.LogInformation("Sync backoff status push works again");
+                return false;
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                return previousPushFailed;
+            }
+            catch (Exception ex)
+            {
+                if (!previousPushFailed)
+                    _logger.LogWarning("Sync backoff status push failed (further failures are not logged until it recovers): {Message}", ex.Message);
+                return true;
             }
         }
 

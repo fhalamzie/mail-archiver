@@ -97,6 +97,11 @@ namespace MailArchiver.Controllers
         private readonly IBatchRestoreService _batchRestoreService;
         private readonly MailArchiver.Utilities.DateTimeHelper _dateTimeHelper;
 
+        private void ResetSyncBackoff(int accountId)
+        {
+            HttpContext.RequestServices.GetService<ISyncBackoffTracker>()?.Reset(accountId);
+        }
+
         private async Task<bool> HasAccessToAccountAsync(int accountId)
         {
             // Use the authentication service to get user info properly
@@ -955,6 +960,10 @@ namespace MailArchiver.Controllers
                     }
 
                     await _context.SaveChangesAsync();
+
+                    // Whoever saves the account has looked at it - typically to fix the credentials a
+                    // failure run is waiting on. Lift the block so the next tick tries again.
+                    ResetSyncBackoff(account.Id);
                     
                     // Log the account update action
                     var authService = HttpContext.RequestServices.GetService<MailArchiver.Services.IAuthenticationService>();
@@ -1007,6 +1016,8 @@ namespace MailArchiver.Controllers
                                 }
                                 
                                 await _context.SaveChangesAsync();
+                                foreach (var acc in accountsToUpdate)
+                                    ResetSyncBackoff(acc.Id);
                                 
                                 // Log the bulk update
                                 if (!string.IsNullOrEmpty(currentUsername))
@@ -2848,6 +2859,9 @@ namespace MailArchiver.Controllers
                 }
 
                 await _context.SaveChangesAsync();
+
+                foreach (var account in accountsToUpdate)
+                    ResetSyncBackoff(account.Id);
 
                 // Log the bulk update action
                 if (!string.IsNullOrEmpty(currentUsername))

@@ -111,6 +111,7 @@ The sync behavior is controlled by the `MailSync` section of `appsettings.json` 
 | `MailSync:IgnoreSelfSignedCert` | `false` | Accept self-signed TLS certificates for IMAP connections. |
 | `MailSync:MaxConcurrentSyncs` | `1` | How many account syncs may run at the same time. Slots are refilled as they come free, see [How accounts are scheduled](#-how-accounts-are-scheduled). `1` keeps syncs sequential; increase to parallelize — mind provider rate limits and local resource usage. |
 | `MailSync:InterAccountDelaySeconds` | `0` | Optional stagger delay in seconds applied at the end of each account sync task. Useful to avoid burst-starts when `MaxConcurrentSyncs > 1`. `0` disables it. |
+| `MailSync:BackoffPushUrl` | _empty_ | Optional push URL (Uptime Kuma push monitor or compatible) that receives `status=up`/`status=down` once a minute, `down` while any account is stuck in a failure run. Any query string on the URL is replaced. See [Backoff after failed syncs](#backoff-after-failed-syncs). |
 | `MailSync:MaxIssuesPerKind` | `20` | How many problems of each kind a sync job remembers for the account page — failed folders, missing folders and failed messages are budgeted separately. Anything beyond is counted, not kept. `0` switches the detail off and leaves only the counters. |
 | `MailSync:GlobalExcludedFolders` | _empty_ | Folders excluded from synchronization for every account, additive to each account's own list. See [Excluded Folders](#-excluded-folders) below. |
 
@@ -329,6 +330,45 @@ pause that keeps its checkpoints, and the slot is free again on the next tick.
 > `MaxConcurrentSyncs: 10` and one six-hour mailbox effectively synced everything on a six-hour
 > interval. Accounts that finish quickly now keep to their own interval regardless of what else is
 > running.
+
+### Backoff after failed syncs
+
+A short interval is cheap while everything works and expensive when it does not: with
+`IntervalMinutes: 1`, an account whose password was changed on the server would attempt sixty failed
+logins an hour, and mail providers tend to answer such series by blocking the client **IP** - taking
+every other account on the same provider down with it.
+
+So every sync that aborts with an exception puts its account into a failure run, and the scheduler
+holds the account back until the run's current step has passed. Which ladder applies depends on why
+the sync failed:
+
+| Failures in a row | Hard: credentials rejected | Soft: anything else |
+|---|---|---|
+| 1 | 5 min | 2 min |
+| 2 | 60 min | 5 min |
+| 3 | 4 h | 15 min |
+| 4 and more | 24 h | 15 min |
+
+*Hard* means the provider refused the credentials: an IMAP authentication failure, a rejected
+Microsoft Entra token request, or a Graph `401`/`403`. *Soft* is everything else that aborts a
+sync - refused connections, timeouts, Graph `429`/`5xx`, unknown errors. A sync that logs in and
+merely fails on individual messages or folders is not a failure run; those have their own handling.
+
+An account never syncs *more* often because of a failure: its normal interval keeps running, the
+backoff only adds a veto on top.
+
+A run ends with the first successful sync. It also ends as soon as someone saves the account on the
+Edit page (or updates the M365 credentials of its domain), so a fixed password is tried on the next
+tick instead of after the remaining day. Every change of a run is logged, at `Warning` once it is
+alarming.
+
+A run is **alarming** once a hard run reaches its second failure or a soft run its sixth (about an
+hour without a successful login - which is what an IP block looks like). With
+`MailSync:BackoffPushUrl` set, alarming accounts turn the push monitor `down`, with their names in
+the message.
+
+The state lives in memory. A restart starts every run over, which costs one additional attempt per
+broken account before the ladder is back at five minutes.
 
 On shutdown the service waits up to 30 seconds for syncs still in flight rather than tearing the
 process down underneath an open IMAP session. They are not cancelled; see
