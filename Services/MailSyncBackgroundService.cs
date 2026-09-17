@@ -25,6 +25,9 @@ namespace MailArchiver.Services
         private static readonly DateTime EpochUtc = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
         // Named HttpClient for MailSync:BackoffPushUrl, registered in Program.cs.
         public const string BackoffPushHttpClientName = "SyncBackoffPush";
+        // A dead man's switch needs a heartbeat, not a stream: once every 15 minutes is plenty for a
+        // monitor whose grace period is measured in hours.
+        private static readonly TimeSpan BackoffPushInterval = TimeSpan.FromMinutes(15);
 
         public MailSyncBackgroundService(
             IServiceProvider serviceProvider,
@@ -60,8 +63,9 @@ namespace MailArchiver.Services
             // the initial burst of the first N tasks starting together).
             var interAccountDelaySeconds = _configuration.GetValue<int>("MailSync:InterAccountDelaySeconds", 0);
             if (interAccountDelaySeconds < 0) interAccountDelaySeconds = 0;
-            // Optional Uptime-Kuma-style push URL reporting whether any account is stuck in a failure
-            // run. Empty = no push.
+            // Optional Uptime-Kuma-style push URL, used as a dead man's switch: it is pushed "up"
+            // while no account is stuck in an alarming failure run, and not pushed at all otherwise.
+            // Empty = no push.
             var backoffPushUrl = _configuration.GetValue<string>("MailSync:BackoffPushUrl");
             var lastBackoffPushUtc = DateTime.MinValue;
             var lastBackoffPushFailed = false;
@@ -304,13 +308,13 @@ namespace MailArchiver.Services
                         }, CancellationToken.None);
                     }
 
-                    // At most once a minute: the tick wakes early whenever a slot frees up.
                     if (!string.IsNullOrWhiteSpace(backoffPushUrl)
-                        && DateTime.UtcNow - lastBackoffPushUtc >= TimeSpan.FromSeconds(PollIntervalSeconds))
+                        && backoff.AlarmingAccounts().Count == 0
+                        && DateTime.UtcNow - lastBackoffPushUtc >= BackoffPushInterval)
                     {
                         lastBackoffPushUtc = DateTime.UtcNow;
-                        lastBackoffPushFailed = await PushBackoffStatusAsync(
-                            backoffPushUrl, backoff, accountsById, lastBackoffPushFailed, stoppingToken);
+                        lastBackoffPushFailed = await PushBackoffHeartbeatAsync(
+                            backoffPushUrl, lastBackoffPushFailed, stoppingToken);
                     }
 
                 }
@@ -634,40 +638,23 @@ namespace MailArchiver.Services
         }
 
         /// <summary>
-        /// Reports to an Uptime-Kuma-style push URL whether any account is stuck in an alarming
-        /// failure run. Any query string on the configured URL is replaced. Returns whether the push
-        /// failed, so a monitor that stays unreachable is logged once instead of every minute.
+        /// Pushes "up" to an Uptime-Kuma-style push URL. Only called while no account is in an alarming
+        /// failure run, so the monitor turns red when the pushes stop - because accounts are stuck, or
+        /// because the scheduler itself is. No "down" is ever sent: a channel that goes red on every
+        /// single incident stops being read. Any query string on the configured URL is replaced.
+        /// Returns whether the push failed, so an unreachable monitor is logged once, not every time.
         /// </summary>
-        private async Task<bool> PushBackoffStatusAsync(
-            string pushUrl,
-            ISyncBackoffTracker backoff,
-            IReadOnlyDictionary<int, MailAccount> accountsById,
-            bool previousPushFailed,
-            CancellationToken ct)
+        private async Task<bool> PushBackoffHeartbeatAsync(string pushUrl, bool previousPushFailed, CancellationToken ct)
         {
             try
             {
-                var alarming = backoff.AlarmingAccounts()
-                    .Select(id => accountsById.TryGetValue(id, out var a) ? a.Name : $"#{id}")
-                    .ToList();
-
-                var message = alarming.Count == 0
-                    ? "OK"
-                    : $"Sync failing: {string.Join(", ", alarming)}";
-                if (message.Length > 200)
-                    message = message[..197] + "...";
-
-                var builder = new UriBuilder(pushUrl)
-                {
-                    Query = $"status={(alarming.Count == 0 ? "up" : "down")}&msg={Uri.EscapeDataString(message)}&ping="
-                };
-
+                var builder = new UriBuilder(pushUrl) { Query = "status=up&msg=OK&ping=" };
                 var client = _serviceProvider.GetRequiredService<IHttpClientFactory>().CreateClient(BackoffPushHttpClientName);
                 using var response = await client.GetAsync(builder.Uri, ct);
                 response.EnsureSuccessStatusCode();
 
                 if (previousPushFailed)
-                    _logger.LogInformation("Sync backoff status push works again");
+                    _logger.LogInformation("Sync backoff heartbeat push works again");
                 return false;
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -677,7 +664,7 @@ namespace MailArchiver.Services
             catch (Exception ex)
             {
                 if (!previousPushFailed)
-                    _logger.LogWarning("Sync backoff status push failed (further failures are not logged until it recovers): {Message}", ex.Message);
+                    _logger.LogWarning("Sync backoff heartbeat push failed (further failures are not logged until it recovers): {Message}", ex.Message);
                 return true;
             }
         }

@@ -111,7 +111,7 @@ The sync behavior is controlled by the `MailSync` section of `appsettings.json` 
 | `MailSync:IgnoreSelfSignedCert` | `false` | Accept self-signed TLS certificates for IMAP connections. |
 | `MailSync:MaxConcurrentSyncs` | `1` | How many account syncs may run at the same time. Slots are refilled as they come free, see [How accounts are scheduled](#-how-accounts-are-scheduled). `1` keeps syncs sequential; increase to parallelize — mind provider rate limits and local resource usage. |
 | `MailSync:InterAccountDelaySeconds` | `0` | Optional stagger delay in seconds applied at the end of each account sync task. Useful to avoid burst-starts when `MaxConcurrentSyncs > 1`. `0` disables it. |
-| `MailSync:BackoffPushUrl` | _empty_ | Optional push URL (Uptime Kuma push monitor or compatible) that receives `status=up`/`status=down` once a minute, `down` while any account is stuck in a failure run. Any query string on the URL is replaced. See [Backoff after failed syncs](#backoff-after-failed-syncs). |
+| `MailSync:BackoffPushUrl` | _empty_ | Optional push URL (Uptime Kuma push monitor or compatible), used as a dead man's switch: pushed `status=up` every 15 minutes while no account is stuck in a failure run, not pushed at all otherwise. Any query string on the URL is replaced. See [Backoff after failed syncs](#backoff-after-failed-syncs). |
 | `MailSync:MaxIssuesPerKind` | `20` | How many problems of each kind a sync job remembers for the account page — failed folders, missing folders and failed messages are budgeted separately. Anything beyond is counted, not kept. `0` switches the detail off and leaves only the counters. |
 | `MailSync:GlobalExcludedFolders` | _empty_ | Folders excluded from synchronization for every account, additive to each account's own list. See [Excluded Folders](#-excluded-folders) below. |
 
@@ -364,8 +364,11 @@ alarming.
 
 A run is **alarming** once a hard run reaches its second failure or a soft run its sixth (about an
 hour without a successful login - which is what an IP block looks like). With
-`MailSync:BackoffPushUrl` set, alarming accounts turn the push monitor `down`, with their names in
-the message.
+`MailSync:BackoffPushUrl` set, the scheduler pushes `up` every 15 minutes while no account is
+alarming and stops pushing while any is; the monitor goes red once its own grace period passes
+without a push. No `down` is ever sent, so a hiccup that clears on its own never reaches the monitor,
+and a scheduler that stops running turns it red just the same. Which accounts are affected is in the
+log.
 
 The state lives in memory. A restart starts every run over, which costs one additional attempt per
 broken account before the ladder is back at five minutes.
